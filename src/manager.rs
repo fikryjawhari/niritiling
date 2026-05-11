@@ -1,7 +1,7 @@
 use crate::connection::{NiriConnection, NiriState, WindowPosition};
 use anyhow::Result;
 use log::{debug, error, info};
-use niri_ipc::{Action, Event, Window};
+use niri_ipc::{Action, Event, SizeChange, Window};
 use std::collections::HashMap;
 
 const MAXIMIZED_RATIO_THRESHOLD: f64 = 0.9;
@@ -10,14 +10,20 @@ pub struct NiriContext {
     pub connection: Box<dyn NiriConnection>,
     pub tracked_window_positions: HashMap<u64, WindowPosition>,
     pub debounced_maximize_state: HashMap<u64, (bool, std::time::Instant)>,
+    pub tracked_column_widths: HashMap<u64, HashMap<usize, f64>>,
+    pub last_maximize_action_time: HashMap<u64, std::time::Instant>,
+    pub resize_columns: bool,
 }
 
 impl NiriContext {
-    pub fn new(connection: Box<dyn NiriConnection>) -> Self {
+    pub fn new(connection: Box<dyn NiriConnection>, resize_columns: bool) -> Self {
         Self {
             connection,
             tracked_window_positions: HashMap::new(),
             debounced_maximize_state: HashMap::new(),
+            tracked_column_widths: HashMap::new(),
+            last_maximize_action_time: HashMap::new(),
+            resize_columns,
         }
     }
 
@@ -137,6 +143,8 @@ impl NiriContext {
                     ws_id, win_id
                 );
                 self.perform_maximize_action(win_id, true)?;
+                self.last_maximize_action_time
+                    .insert(ws_id, std::time::Instant::now());
             }
         } else {
             let target_nudge_focus = self.query_focused_window().ok().flatten();
@@ -178,6 +186,8 @@ impl NiriContext {
             }
 
             if did_unmaximize {
+                self.last_maximize_action_time
+                    .insert(ws_id, std::time::Instant::now());
                 debug!(
                     "workspace {}: waiting for layout to settle before viewport nudge",
                     ws_id
@@ -195,6 +205,145 @@ impl NiriContext {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn redistribute_on_column_resize(
+        &mut self,
+        ws_id: u64,
+        state: &NiriState,
+        _windows_map: &HashMap<u64, &Window>,
+    ) -> Result<()> {
+        let output_name = match state.ws_outputs.get(&ws_id) {
+            Some(name) => name,
+            None => return Ok(()),
+        };
+        let output_width = match state.output_widths.get(output_name) {
+            Some(&w) if w > 0.0 => w,
+            _ => return Ok(()),
+        };
+
+        let tiled: Vec<&Window> = state
+            .windows
+            .iter()
+            .filter(|w| w.workspace_id == Some(ws_id) && !w.is_floating)
+            .filter(|w| w.layout.pos_in_scrolling_layout.is_some())
+            .collect();
+
+        let mut current_columns: HashMap<usize, (f64, u64)> = HashMap::new();
+        for w in &tiled {
+            if let Some((col_idx, _)) = w.layout.pos_in_scrolling_layout {
+                current_columns
+                    .entry(col_idx)
+                    .or_insert((w.layout.tile_size.0, w.id));
+            }
+        }
+
+        let col_count = current_columns.len();
+
+        // Only handle exactly 2 columns
+        if col_count != 2 {
+            self.tracked_column_widths.clear();
+            return Ok(());
+        }
+
+        let prev_widths = self.tracked_column_widths.get(&ws_id);
+
+        let suppressed = self
+            .last_maximize_action_time
+            .get(&ws_id)
+            .map_or(false, |t| {
+                t.elapsed() < std::time::Duration::from_millis(500)
+            });
+
+        let any_maximized = current_columns
+            .values()
+            .any(|&(w, _)| w / output_width > MAXIMIZED_RATIO_THRESHOLD);
+
+        if !suppressed && !any_maximized && prev_widths.is_some_and(|pw| pw.len() == 2) {
+            let prev = prev_widths.unwrap();
+
+            let cols: Vec<usize> = current_columns.keys().copied().collect();
+            let col_a = cols[0];
+            let col_b = cols[1];
+
+            let (cur_a, _wid_a) = current_columns[&col_a];
+            let (cur_b, wid_b) = current_columns[&col_b];
+            let prev_a = prev.get(&col_a).copied().unwrap_or(cur_a);
+            let prev_b = prev.get(&col_b).copied().unwrap_or(cur_b);
+
+            let delta_a = cur_a - prev_a;
+            let delta_b = cur_b - prev_b;
+
+            // Only act when exactly one column changed by a meaningful amount
+            // and the other didn't (i.e. the user resized one column)
+            let a_changed = delta_a.abs() > 2.0;
+            let b_changed = delta_b.abs() > 2.0;
+
+            if a_changed && !b_changed {
+                let delta_px = delta_a.round() as i32;
+                info!(
+                    "workspace {}: column {} resized by {}px, adjusting column {} (window {})",
+                    ws_id, col_a, delta_px, col_b, wid_b
+                );
+                let focused = self.query_focused_window().ok().flatten();
+                self.send_action(Action::SetWindowWidth {
+                    id: Some(wid_b),
+                    change: SizeChange::AdjustFixed(-delta_px),
+                })?;
+
+                // If the left column grew, nudge viewport after layout settles
+                if col_b < col_a && delta_px < 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let _ = self.send_action(Action::FocusColumnLeft {});
+                    if let Some(orig) = focused {
+                        let _ = self.send_action(Action::FocusWindow { id: orig });
+                    }
+                }
+
+                // Update tracking to the expected state so we don't re-trigger
+                let mut new_tracked = HashMap::new();
+                new_tracked.insert(col_a, cur_a);
+                new_tracked.insert(col_b, cur_b - delta_a);
+                self.tracked_column_widths.insert(ws_id, new_tracked);
+                return Ok(());
+            } else if b_changed && !a_changed {
+                let (_, wid_a) = current_columns[&col_a];
+                let delta_px = delta_b.round() as i32;
+                info!(
+                    "workspace {}: column {} resized by {}px, adjusting column {} (window {})",
+                    ws_id, col_b, delta_px, col_a, wid_a
+                );
+                let focused = self.query_focused_window().ok().flatten();
+                self.send_action(Action::SetWindowWidth {
+                    id: Some(wid_a),
+                    change: SizeChange::AdjustFixed(-delta_px),
+                })?;
+
+                // If the left column grew, nudge viewport after layout settles
+                if col_a < col_b && delta_px < 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let _ = self.send_action(Action::FocusColumnLeft {});
+                    if let Some(orig) = focused {
+                        let _ = self.send_action(Action::FocusWindow { id: orig });
+                    }
+                }
+
+                let mut new_tracked = HashMap::new();
+                new_tracked.insert(col_a, cur_a - delta_b);
+                new_tracked.insert(col_b, cur_b);
+                self.tracked_column_widths.insert(ws_id, new_tracked);
+                return Ok(());
+            }
+        }
+
+        // Update tracking baseline
+        let widths: HashMap<usize, f64> = current_columns
+            .iter()
+            .map(|(&col, &(w, _))| (col, w))
+            .collect();
+        self.tracked_column_widths.insert(ws_id, widths);
+
         Ok(())
     }
 
@@ -329,6 +478,15 @@ impl NiriContext {
             for ws_id in affected_workspaces {
                 if let Err(e) = self.evaluate_workspace(ws_id, &state, &windows_map) {
                     error!("error evaluating workspace {}: {:?}", ws_id, e);
+                }
+                if self.resize_columns {
+                    if let Err(e) = self.redistribute_on_column_resize(ws_id, &state, &windows_map)
+                    {
+                        error!(
+                            "error redistributing columns for workspace {}: {:?}",
+                            ws_id, e
+                        );
+                    }
                 }
             }
 

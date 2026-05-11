@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use log::{error, info};
 use niri_ipc::socket::Socket;
 use niri_ipc::{Event, Request};
+use std::env;
 
 mod connection;
 mod manager;
@@ -14,10 +15,25 @@ use crate::manager::NiriContext;
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    info!("niritiling: starting");
+
+    let args: Vec<String> = env::args().collect();
+    let resize_columns = args.iter().any(|a| a == "--resize-columns");
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("Usage: niritiling [OPTIONS]");
+        println!();
+        println!("Options:");
+        println!(
+            "  --resize-columns  When a column is resized, adjust the other column to compensate"
+        );
+        println!("  -h, --help        Show this help message");
+        return Ok(());
+    }
+
+    info!("niritiling: starting (resize_columns={})", resize_columns);
 
     loop {
-        if let Err(e) = run_event_loop() {
+        if let Err(e) = run_event_loop(resize_columns) {
             error!(
                 "fatal error in event loop: {:?}. attempting to reconnect in 5 seconds...",
                 e
@@ -29,9 +45,9 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_event_loop() -> Result<()> {
+fn run_event_loop(resize_columns: bool) -> Result<()> {
     let conn = SocketConnection::new()?;
-    let mut context = NiriContext::new(Box::new(conn));
+    let mut context = NiriContext::new(Box::new(conn), resize_columns);
 
     let mut event_socket = Socket::connect().context("connecting to niri event stream")?;
     let _ = event_socket

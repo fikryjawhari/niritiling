@@ -7,6 +7,12 @@ in
   options.services.niritiling = {
     enable = lib.mkEnableOption "automatic window tiling for the first window in Niri";
 
+    resizeColumns = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "When a column is resized, adjust the other column to compensate (only works with exactly two columns).";
+    };
+
     systemdTarget = lib.mkOption {
       type = lib.types.str;
       default = "graphical-session.target";
@@ -22,7 +28,7 @@ in
       wantedBy = [ cfg.systemdTarget ];
 
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/niritiling";
+        ExecStart = "${cfg.package}/bin/niritiling${lib.optionalString cfg.resizeColumns " --resize-columns"}";
         Restart = "on-failure";
         RestartSec = 2;
 

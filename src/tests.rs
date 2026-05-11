@@ -1,7 +1,7 @@
 use super::connection::{NiriConnection, NiriState, WindowPosition};
 use super::manager::NiriContext;
 use anyhow::Result;
-use niri_ipc::{Action, Event, Window};
+use niri_ipc::{Action, Event, SizeChange, Window};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -29,7 +29,14 @@ impl NiriConnection for MockConnection {
     }
 }
 
-fn create_mock_window(id: u64, ws_id: u64, col: usize, tile: usize, width: f64) -> Window {
+fn create_mock_window_at(
+    id: u64,
+    ws_id: u64,
+    col: usize,
+    tile: usize,
+    width: f64,
+    tile_x: f64,
+) -> Window {
     use serde_json::json;
     let w_int = width as i32;
     let v = json!({
@@ -43,13 +50,17 @@ fn create_mock_window(id: u64, ws_id: u64, col: usize, tile: usize, width: f64) 
         "is_urgent": false,
         "layout": {
             "window_size": [w_int, 0],
-            "tile_pos_in_workspace_view": [0, 0],
+            "tile_pos_in_workspace_view": [tile_x, 0],
             "window_offset_in_tile": [0, 0],
             "tile_size": [w_int, 0],
             "pos_in_scrolling_layout": [col, tile]
         }
     });
     serde_json::from_value(v).expect("failed to deserialize mock window")
+}
+
+fn create_mock_window(id: u64, ws_id: u64, col: usize, tile: usize, width: f64) -> Window {
+    create_mock_window_at(id, ws_id, col, tile, width, 0.0)
 }
 
 fn create_mock_fullscreen_window(id: u64, ws_id: u64, width: f64) -> Window {
@@ -76,6 +87,13 @@ fn create_mock_fullscreen_window(id: u64, ws_id: u64, width: f64) -> Window {
 }
 
 fn setup_test(windows: Vec<Window>) -> (NiriContext, Arc<Mutex<MockState>>) {
+    setup_test_with_resize(windows, false)
+}
+
+fn setup_test_with_resize(
+    windows: Vec<Window>,
+    resize_columns: bool,
+) -> (NiriContext, Arc<Mutex<MockState>>) {
     let output_name = "eDP-1".to_string();
     let mut output_widths = HashMap::new();
     output_widths.insert(output_name.clone(), 1000.0);
@@ -96,7 +114,7 @@ fn setup_test(windows: Vec<Window>) -> (NiriContext, Arc<Mutex<MockState>>) {
     let conn = Box::new(MockConnection {
         shared: shared.clone(),
     });
-    (NiriContext::new(conn), shared)
+    (NiriContext::new(conn, resize_columns), shared)
 }
 
 #[test]
@@ -606,5 +624,183 @@ fn test_close_rightmost_of_three_columns_nudges_viewport_left() {
             .iter()
             .any(|a| matches!(a, Action::FocusColumnLeft {})),
         "FocusColumnLeft should be sent to nudge viewport left after closing rightmost column"
+    );
+}
+
+#[test]
+fn test_resize_column_redistributes_two_columns() {
+    let win1 = create_mock_window_at(100, 1, 0, 0, 500.0, 0.0);
+    let win2 = create_mock_window_at(101, 1, 1, 0, 500.0, 500.0);
+    let (mut ctx, shared) = setup_test_with_resize(vec![win1.clone(), win2.clone()], true);
+
+    ctx.tracked_window_positions.insert(
+        100,
+        WindowPosition {
+            workspace_id: 1,
+            column: Some(0),
+            tile: Some(0),
+        },
+    );
+    ctx.tracked_window_positions.insert(
+        101,
+        WindowPosition {
+            workspace_id: 1,
+            column: Some(1),
+            tile: Some(0),
+        },
+    );
+
+    ctx.tracked_column_widths.insert(1, {
+        let mut m = HashMap::new();
+        m.insert(0, 500.0);
+        m.insert(1, 500.0);
+        m
+    });
+
+    // Simulate user resizing column 0 from 500 to 600
+    let win1_resized = create_mock_window_at(100, 1, 0, 0, 600.0, 0.0);
+    let win2_pushed = create_mock_window_at(101, 1, 1, 0, 500.0, 600.0);
+    shared.lock().unwrap().state.windows = vec![win1_resized.clone(), win2_pushed];
+
+    ctx.handle_event(Event::WindowOpenedOrChanged {
+        window: win1_resized,
+    })
+    .unwrap();
+
+    let actions = &shared.lock().unwrap().actions;
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            Action::SetWindowWidth {
+                id: Some(101),
+                change: SizeChange::AdjustFixed(-100),
+            }
+        )),
+        "SetWindowWidth should shrink the other column by -100px: actions={:?}",
+        actions
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::SetWindowWidth { id: Some(100), .. })),
+        "The resized column itself should NOT get a SetWindowWidth"
+    );
+}
+
+#[test]
+fn test_resize_does_not_cascade() {
+    let win1 = create_mock_window_at(100, 1, 0, 0, 500.0, 0.0);
+    let win2 = create_mock_window_at(101, 1, 1, 0, 500.0, 500.0);
+    let (mut ctx, shared) = setup_test_with_resize(vec![win1.clone(), win2.clone()], true);
+
+    ctx.tracked_window_positions.insert(
+        100,
+        WindowPosition {
+            workspace_id: 1,
+            column: Some(0),
+            tile: Some(0),
+        },
+    );
+    ctx.tracked_window_positions.insert(
+        101,
+        WindowPosition {
+            workspace_id: 1,
+            column: Some(1),
+            tile: Some(0),
+        },
+    );
+
+    ctx.tracked_column_widths.insert(1, {
+        let mut m = HashMap::new();
+        m.insert(0, 500.0);
+        m.insert(1, 500.0);
+        m
+    });
+
+    // First resize: column 0 grows by 100
+    let win1_resized = create_mock_window_at(100, 1, 0, 0, 600.0, 0.0);
+    let win2_same = create_mock_window_at(101, 1, 1, 0, 500.0, 600.0);
+    shared.lock().unwrap().state.windows = vec![win1_resized.clone(), win2_same];
+    ctx.handle_event(Event::WindowOpenedOrChanged {
+        window: win1_resized,
+    })
+    .unwrap();
+
+    shared.lock().unwrap().actions.clear();
+
+    // Second event: both columns now at their expected new sizes (our action took effect)
+    let win1_final = create_mock_window_at(100, 1, 0, 0, 600.0, 0.0);
+    let win2_final = create_mock_window_at(101, 1, 1, 0, 400.0, 600.0);
+    shared.lock().unwrap().state.windows = vec![win1_final.clone(), win2_final];
+    ctx.handle_event(Event::WindowOpenedOrChanged { window: win1_final })
+        .unwrap();
+
+    let actions = &shared.lock().unwrap().actions;
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::SetWindowWidth { .. })),
+        "No further resize should happen after our adjustment settles: actions={:?}",
+        actions
+    );
+}
+
+#[test]
+fn test_resize_not_triggered_with_three_columns() {
+    let win1 = create_mock_window_at(100, 1, 0, 0, 333.0, 0.0);
+    let win2 = create_mock_window_at(101, 1, 1, 0, 333.0, 333.0);
+    let win3 = create_mock_window_at(102, 1, 2, 0, 333.0, 666.0);
+    let (mut ctx, shared) =
+        setup_test_with_resize(vec![win1.clone(), win2.clone(), win3.clone()], true);
+
+    ctx.tracked_window_positions.insert(
+        100,
+        WindowPosition {
+            workspace_id: 1,
+            column: Some(0),
+            tile: Some(0),
+        },
+    );
+    ctx.tracked_window_positions.insert(
+        101,
+        WindowPosition {
+            workspace_id: 1,
+            column: Some(1),
+            tile: Some(0),
+        },
+    );
+    ctx.tracked_window_positions.insert(
+        102,
+        WindowPosition {
+            workspace_id: 1,
+            column: Some(2),
+            tile: Some(0),
+        },
+    );
+
+    ctx.tracked_column_widths.insert(1, {
+        let mut m = HashMap::new();
+        m.insert(0, 333.0);
+        m.insert(1, 333.0);
+        m.insert(2, 333.0);
+        m
+    });
+
+    // Resize column 0 in a 3-column layout
+    let win1_resized = create_mock_window_at(100, 1, 0, 0, 433.0, 0.0);
+    shared.lock().unwrap().state.windows = vec![win1_resized.clone(), win2.clone(), win3.clone()];
+
+    ctx.handle_event(Event::WindowOpenedOrChanged {
+        window: win1_resized,
+    })
+    .unwrap();
+
+    let actions = &shared.lock().unwrap().actions;
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::SetWindowWidth { .. })),
+        "Resize redistribution should NOT happen with 3 columns: actions={:?}",
+        actions
     );
 }

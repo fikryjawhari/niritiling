@@ -8,6 +8,8 @@ tl;dr: it makes sure that if there is only a single non-floating window in a wor
 
 When a workspace has a single tiled (=non-floating) window, it is automatically maximized. When a second tiled window is opened in that workspace, the first reverts back to its previous width. When only one window remains in a workspace after closing another, that triggers maximization again. Floating windows are ignored in the count.
 
+It is also possible to dynamically resize manually resized columns using the `--resize-columns` arg - this only works when exactly two columns are open in a workspace, as that is the only instance in which the following behaviour is not ambiguous.
+
 ## Usage
 
 ### NixOS
@@ -26,7 +28,10 @@ Then, inside a module:
 { inputs, ... }:
 {
   imports = [ inputs.niritiling.nixosModules.default ];
-  config.services.niritiling.enable = true;
+  config.services.niritiling = {
+    enable = true;
+    resizeColumns = true; # if you want dynamically resizing columns on manual width change 
+  };
 }
 ```
 
