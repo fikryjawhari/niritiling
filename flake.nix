@@ -36,7 +36,12 @@
         settings = {
           rust = {
             cargoManifestPath = "./Cargo.toml";
-            check.cargoDeps = pkgs.rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
+            check.cargoDeps = pkgs.rustPlatform.importCargoLock {
+              lockFile = ./Cargo.lock;
+              outputHashes = {
+                "niri-ipc-26.4.0" = "sha256-S7TyDDhu+PAoDSKxBHJ4BCTvg7Tu2ct1ZRZH6gOnN34=";
+              };
+            };
           };
         };
         hooks = {
@@ -50,7 +55,12 @@
           pname = "niritiling";
           version = "0.1.1";
           src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "niri-ipc-26.4.0" = "sha256-S7TyDDhu+PAoDSKxBHJ4BCTvg7Tu2ct1ZRZH6gOnN34=";
+            };
+          };
           meta.mainProgram = "niritiling";
         };
         default = niritiling;

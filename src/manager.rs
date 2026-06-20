@@ -1,15 +1,28 @@
 use crate::connection::{NiriConnection, NiriState, WindowPosition};
 use anyhow::Result;
 use log::{debug, error, info};
-use niri_ipc::{Action, Event, Window};
-use std::collections::HashMap;
+use niri_ipc::{Action, Event, SizeChange, Window};
+use std::collections::{HashMap, HashSet};
 
-const MAXIMIZED_RATIO_THRESHOLD: f64 = 0.9;
+// A window is considered "at full width" if its tile occupies more than 90% of the output.
+const FULL_WIDTH_RATIO_THRESHOLD: f64 = 0.9;
+
+// The proportion niritiling sets a column to when it is the only window (single column).
+// In niri-ipc, SizeChange::SetProportion uses 0-100 scale (50.0 = 50%).
+const SINGLE_WINDOW_PROPORTION: f64 = 100.0;
+
+// The proportion niritiling resets a column to when a second window appears.
+// Should match default-column-width in your niri config (0.49999 proportion = 49.999 here).
+const DEFAULT_PROPORTION: f64 = 49.999;
 
 pub struct NiriContext {
     pub connection: Box<dyn NiriConnection>,
     pub tracked_window_positions: HashMap<u64, WindowPosition>,
     pub debounced_maximize_state: HashMap<u64, (bool, std::time::Instant)>,
+    /// Window IDs that niritiling itself set to full width via SetColumnWidth.
+    /// Used to distinguish niritiling-managed full-width from windows the user
+    /// manually maximized or resized — those are never touched by niritiling.
+    pub niritiling_full_width: HashSet<u64>,
 }
 
 impl NiriContext {
@@ -18,6 +31,7 @@ impl NiriContext {
             connection,
             tracked_window_positions: HashMap::new(),
             debounced_maximize_state: HashMap::new(),
+            niritiling_full_width: HashSet::new(),
         }
     }
 
@@ -33,7 +47,7 @@ impl NiriContext {
         self.connection.query_full_state()
     }
 
-    fn is_maximized(
+    fn is_full_width(
         &self,
         window_id: u64,
         state: &NiriState,
@@ -52,7 +66,7 @@ impl NiriContext {
                             "window {} tile_width={:.0} output_width={:.0} ratio={:.2}",
                             window_id, tile_width, output_width, ratio
                         );
-                        return ratio > MAXIMIZED_RATIO_THRESHOLD;
+                        return ratio > FULL_WIDTH_RATIO_THRESHOLD;
                     }
                 }
             }
@@ -60,9 +74,15 @@ impl NiriContext {
         false
     }
 
-    fn perform_maximize_action(
+    /// Sets the width of `target_window_id`'s column to `proportion` (0–100 scale).
+    /// Temporarily shifts focus to the target window if needed, then restores it
+    /// if `restore_focus` is true.
+    /// Updates `niritiling_full_width` to track which windows niritiling has set
+    /// to full width, so user-initiated maximization is never overridden.
+    fn perform_set_width_action(
         &mut self,
         target_window_id: u64,
+        proportion: f64,
         restore_focus: bool,
     ) -> Result<()> {
         let original_focus = self.query_focused_window().ok().flatten();
@@ -73,7 +93,16 @@ impl NiriContext {
             })?;
         }
 
-        self.send_action(Action::MaximizeColumn {})?;
+        self.send_action(Action::SetColumnWidth {
+            change: SizeChange::SetProportion(proportion),
+        })?;
+
+        // Track whether this window is at niritiling-managed full width.
+        if (proportion - SINGLE_WINDOW_PROPORTION).abs() < 1e-9 {
+            self.niritiling_full_width.insert(target_window_id);
+        } else {
+            self.niritiling_full_width.remove(&target_window_id);
+        }
 
         if restore_focus {
             if let Some(orig_id) = original_focus {
@@ -115,16 +144,16 @@ impl NiriContext {
             return Ok(());
         } else if column_count == 1 {
             let win_id = tiled_windows[0].id;
-            if !self.is_maximized(win_id, state, windows_map) {
+            if !self.is_full_width(win_id, state, windows_map) {
                 let now = std::time::Instant::now();
-                if let Some(&(target_maximized, last_time)) =
+                if let Some(&(target_full_width, last_time)) =
                     self.debounced_maximize_state.get(&win_id)
                 {
-                    if target_maximized
+                    if target_full_width
                         && now.duration_since(last_time) < std::time::Duration::from_millis(200)
                     {
                         debug!(
-                            "workspace {}: skipping maximize for window {} due to debounce",
+                            "workspace {}: skipping full-width for window {} due to debounce",
                             ws_id, win_id
                         );
                         return Ok(());
@@ -133,33 +162,36 @@ impl NiriContext {
                 self.debounced_maximize_state.insert(win_id, (true, now));
 
                 info!(
-                    "workspace {}: single column -> maximizing window {}",
+                    "workspace {}: single column -> setting window {} to full width",
                     ws_id, win_id
                 );
-                self.perform_maximize_action(win_id, true)?;
+                self.perform_set_width_action(win_id, SINGLE_WINDOW_PROPORTION, true)?;
             }
         } else {
-            let target_nudge_focus = self.query_focused_window().ok().flatten();
             let mut cols_vec: Vec<usize> = unique_columns.into_iter().collect();
             cols_vec.sort_unstable();
 
-            let mut did_unmaximize = false;
+            let mut did_reset_width = false;
             for &col_idx in &cols_vec {
                 if let Some(w) = tiled_windows
                     .iter()
                     .find(|w| w.layout.pos_in_scrolling_layout.map(|(c, _)| c) == Some(col_idx))
                 {
-                    if self.is_maximized(w.id, state, windows_map) {
+                    // Only reset if niritiling was the one that set this window to full
+                    // width. If the user manually maximized or resized it, we leave it alone.
+                    if self.is_full_width(w.id, state, windows_map)
+                        && self.niritiling_full_width.contains(&w.id)
+                    {
                         let now = std::time::Instant::now();
-                        if let Some(&(target_maximized, last_time)) =
+                        if let Some(&(target_full_width, last_time)) =
                             self.debounced_maximize_state.get(&w.id)
                         {
-                            if !target_maximized
+                            if !target_full_width
                                 && now.duration_since(last_time)
                                     < std::time::Duration::from_millis(200)
                             {
                                 debug!(
-                                    "workspace {}: skipping un-maximize for window {} due to debounce",
+                                    "workspace {}: skipping width reset for window {} due to debounce",
                                     ws_id, w.id
                                 );
                                 continue;
@@ -168,31 +200,21 @@ impl NiriContext {
                         self.debounced_maximize_state.insert(w.id, (false, now));
 
                         info!(
-                            "workspace {}: multiple columns -> un-maximizing window {} in column {}",
+                            "workspace {}: multiple columns -> resetting width of window {} in column {}",
                             ws_id, w.id, col_idx
                         );
-                        self.perform_maximize_action(w.id, false)?;
-                        did_unmaximize = true;
+                        self.perform_set_width_action(w.id, DEFAULT_PROPORTION, true)?;
+                        did_reset_width = true;
                     }
                 }
             }
 
-            if did_unmaximize {
-                debug!(
-                    "workspace {}: waiting for layout to settle before viewport nudge",
-                    ws_id
-                );
+            if did_reset_width {
+                // Wait for niri to settle the layout before adjusting the viewport,
+                // otherwise on-overflow centering may fire against the old (full-width) layout.
                 std::thread::sleep(std::time::Duration::from_millis(50));
-
-                debug!(
-                    "workspace {}: nudging viewport left (target focus: {:?})",
-                    ws_id, target_nudge_focus
-                );
-                self.send_action(Action::FocusColumnLeft {})?;
-                if let Some(orig_id) = target_nudge_focus {
-                    debug!("workspace {}: restoring focus to {}", ws_id, orig_id);
-                    let _ = self.send_action(Action::FocusWindow { id: orig_id });
-                }
+                let _ = self.send_action(Action::FocusColumnLeft {});
+                let _ = self.send_action(Action::FocusColumnRight {});
             }
         }
         Ok(())
@@ -250,6 +272,7 @@ impl NiriContext {
                 if is_floating {
                     if let Some(pos) = old_pos {
                         self.tracked_window_positions.remove(&id);
+                        self.niritiling_full_width.remove(&id);
                         info!(
                             "window {} became floating, re-evaluating ws {}",
                             id, pos.workspace_id
@@ -304,6 +327,7 @@ impl NiriContext {
 
             Event::WindowClosed { id } => {
                 if let Some(pos) = self.tracked_window_positions.remove(&id) {
+                    self.niritiling_full_width.remove(&id);
                     info!(
                         "window {} closed, re-evaluating ws {}",
                         id, pos.workspace_id
@@ -333,27 +357,25 @@ impl NiriContext {
             }
 
             for closed_pos in &closed_positions {
-                if let Some(closed_col) = closed_pos.column {
-                    let min_remaining_col = self
-                        .tracked_window_positions
-                        .values()
-                        .filter(|p| p.workspace_id == closed_pos.workspace_id)
-                        .filter_map(|p| p.column)
-                        .min();
+                // If 2+ columns remain after the close, snap the viewport so the
+                // last column is right-edge-aligned, eliminating empty space on the right.
+                // FocusColumnFirst then FocusColumnLast achieves this regardless of widths.
+                // Focus is not restored — niri already moved it to the next sensible window.
+                let remaining_col_count = self
+                    .tracked_window_positions
+                    .values()
+                    .filter(|p| p.workspace_id == closed_pos.workspace_id)
+                    .filter_map(|p| p.column)
+                    .collect::<HashSet<_>>()
+                    .len();
 
-                    if let Some(min_col) = min_remaining_col {
-                        if closed_col > min_col {
-                            debug!(
-                                "closed window column {} had columns to the left, nudging viewport left",
-                                closed_col
-                            );
-                            let target_focus = self.query_focused_window().ok().flatten();
-                            let _ = self.send_action(Action::FocusColumnLeft {});
-                            if let Some(orig_id) = target_focus {
-                                let _ = self.send_action(Action::FocusWindow { id: orig_id });
-                            }
-                        }
-                    }
+                if remaining_col_count >= 2 {
+                    debug!(
+                        "closed window on ws {}, {} columns remain — snapping viewport to last column",
+                        closed_pos.workspace_id, remaining_col_count
+                    );
+                    let _ = self.send_action(Action::FocusColumnFirst {});
+                    let _ = self.send_action(Action::FocusColumnLast {});
                 }
             }
         }
