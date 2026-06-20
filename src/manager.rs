@@ -212,7 +212,7 @@ impl NiriContext {
             if did_reset_width {
                 // Wait for niri to settle the layout before adjusting the viewport,
                 // otherwise on-overflow centering may fire against the old (full-width) layout.
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 let _ = self.send_action(Action::FocusColumnLeft {});
                 let _ = self.send_action(Action::FocusColumnRight {});
             }
